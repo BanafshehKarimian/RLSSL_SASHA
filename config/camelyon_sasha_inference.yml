@@ -1,0 +1,23 @@
+## RL hyper parameters
+B: 1
+
+# Dataset details
+fglobal: 'mlp'
+
+## pretrained backbone
+backbone: 'ViT-S/16'   #'ResNet_50' 'ViT-S/16'
+pretrain: 'medical_ssl' #natural_supervised medical_ssl
+D_feat: 384
+D_inner: 128
+only_ce_as_reward: True
+
+
+# Model weights -
+frac_visit: 0.2
+cosine_threshold: 0.95
+
+# Extra Hyper params
+n_worker: 8
+pin_memory: False
+n_shot: -1
+dim_reduction: False

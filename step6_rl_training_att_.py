@@ -1,0 +1,1368 @@
+"""
+This script initiates the training of the RL Agent component after separately training the HAFED pipeline,
+which includes the Feature Aggregator, Classifier and the Targeted State Updater (TSU).
+
+During this phase:
+- Pretrained weights for both the Feature Aggregator and TSU are loaded from their respective checkpoints.
+- The RL Agent is trained to intelligently select patches based on the above models.
+
+
+Commands
+CAMELYON16
+python step6_rl_training.py --config config/camelyon_rl_config.yml --seed 5  --log_dir LOG_DIR
+
+TCGA
+python step6_rl_training.py --config config/tcga_rl_config.yml --seed 1  --log_dir LOG_DIR
+
+"""
+
+import argparse
+import gc
+import os
+from pprint import pprint
+from types import SimpleNamespace
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torchmetrics
+import yaml
+from sklearn.metrics import balanced_accuracy_score
+from timm.utils import accuracy
+from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
+
+from architecture.transformer import HAFED
+from datasets.datasets import build_HDF5_feat_dataset_2
+from envs.WSI_cosine_env import WSICosineObservationEnv
+from envs.WSI_env import WSIObservationEnv
+from modules.fglobal_mlp import FGlobal
+from rl_algorithms.ppo import Agent, Actor, Critic
+from rl_algorithms.ppo import Agent
+from rl_algorithms.ppo import TransformerActor as Actor
+#from rl_algorithms.ppo import TransformerCritic as Critic
+from step4_extract_intermediate_features import load_model
+from utils.gpu_utils import check_gpu_availability
+from utils.utils import MetricLogger, SmoothedValue, adjust_learning_rate
+from utils.utils import save_policy_model, Struct, set_seed
+
+
+def get_arguments():
+
+    parser = argparse.ArgumentParser('RL training', add_help=False)
+    parser.add_argument('--frac_visit', type=float, default=0.2)
+    parser.add_argument('--config', default= None, help='path to config file')
+    parser.add_argument('--seed', type=int, default=5, help='set the seed to select dataset split') 
+    parser.add_argument('--classifier_arch', default='hafed', choices=['hafed'], help='choice of architecture for HACMIL')
+    parser.add_argument('--exp_name', type=str, default='DEBUG', help='name of the exp')
+    parser.add_argument('--logs', default='enabled', choices=['enabled', 'disabled'], type=str, help='flag to save logs')
+    parser.add_argument('--log_dir', default=None, type=str, help='Log dir path to save model and logs')
+    parser.add_argument('--restart', action='store_true')
+    parser.add_argument('--rl_ckpt_path', default=None, type=str, help='Log dir path to save model and logs')
+
+    args = parser.parse_args()
+
+    # Adding Device Details
+    gpus = check_gpu_availability(10, 1, [])
+    print(f"occupied {gpus}")
+    args.device = torch.device(f"cuda")
+
+    return args
+
+def compute_rtgs(batch_rews, conf):
+    """
+        Compute the Reward-To-Go of each timestep in a batch given the rewards.
+
+        Parameters:
+            batch_rews - the rewards in a batch, Shape: (number of episodes, number of timesteps per episode)
+
+        Return:
+            batch_rtgs - the rewards to go, Shape: (number of timesteps in batch)
+    """
+    # The rewards-to-go (rtg) per episode per batch to return.
+    # The shape will be (num timesteps per episode)
+    batch_rtgs = []
+
+    # Iterate through each episode
+    for ep_rews in reversed(batch_rews):
+
+        discounted_reward = 0 # The discounted reward so far
+
+        # Iterate through all rewards in the episode. We go backwards for smoother calculation of each
+        # discounted return (think about why it would be harder starting from the beginning)
+        for rew in reversed(ep_rews):
+            discounted_reward = rew + discounted_reward * conf.gamma
+            batch_rtgs.insert(0, discounted_reward)
+
+    # Convert the rewards-to-go into a tensor
+    batch_rtgs = torch.tensor(batch_rtgs, dtype=torch.float)
+
+    return batch_rtgs
+
+
+def gae(rewards, values, episode_ends, gamma, lam):
+    """Compute generalized advantage estimate.
+        rewards: a list of rewards at each step.
+        values: the value estimate of the state at each step.
+        episode_ends: an array of the same shape as rewards, with a 1 if the
+            episode ended at that step and a 0 otherwise.
+        gamma: the discount factor.
+        lam: the GAE lambda parameter.
+    """
+    # Invert episode_ends to have 0 if the episode ended and 1 otherwise
+    episode_ends = (episode_ends * -1) + 1
+
+    N = rewards.shape[0]
+    T = rewards.shape[1]
+    gae_step = np.zeros((N, ))
+    advantages = np.zeros((N, T))
+
+    for t in reversed(range(T)):
+    # for t in reversed(range(T - 1)):
+        # First compute delta, which is the one-step TD error
+        next_values = values[:, t + 1] if (t + 1) < T else 0.0
+        delta = rewards[:, t] + gamma * next_values * episode_ends[:, t] - values[:, t]
+        # delta = rewards[:, t] + gamma * values[:, t + 1] * episode_ends[:, t] - values[:, t]
+        # Then compute the current step's GAE by discounting the previous step
+        # of GAE, resetting it to zero if the episode ended, and adding this
+        # step's delta
+        gae_step = delta + gamma * lam * episode_ends[:, t] * gae_step
+        # And store it
+        advantages[:, t] = gae_step
+    return advantages
+
+
+def load_policy_model(model, actor_optimizer, critic_optimizer, load_path, device="cpu"):
+    # Load the checkpoint
+    checkpoint = torch.load(load_path, map_location=device)
+
+    # Load model weights
+    model.load_state_dict(checkpoint['model'])
+
+    # Load optimizer states
+    actor_optimizer.load_state_dict(checkpoint['actor_optimizer'])
+    critic_optimizer.load_state_dict(checkpoint['critic_optimizer'])
+
+    # Get epoch number and config
+    epoch = checkpoint['epoch']
+    config = checkpoint['config']
+
+    print(f"Model loaded from {load_path} at epoch {epoch}")
+
+    return model, actor_optimizer, critic_optimizer, epoch, config
+def load_actor_only(model, load_path, device="cpu"):
+
+    checkpoint = torch.load(load_path, map_location=device)
+
+    full_state_dict = checkpoint["model"]
+
+    actor_state_dict = {
+        key.replace("actor.", "", 1): value
+        for key, value in full_state_dict.items()
+        if key.startswith("actor.")
+    }
+
+    if len(actor_state_dict) == 0:
+        raise RuntimeError(
+            f"No actor.* parameters were found in checkpoint: {load_path}"
+        )
+
+    missing_keys, unexpected_keys = model.actor.load_state_dict(
+        actor_state_dict,
+        strict=True,
+    )
+
+    return model
+
+def main(random_seed=11):
+    # getting and config file
+    args = get_arguments()
+
+
+    with open(args.config, 'r') as ymlfile:
+        c = yaml.load(ymlfile, Loader=yaml.FullLoader)
+        c.update(vars(args))
+        conf = Struct(**c)
+        conf.log_dir = os.path.join(conf.log_dir, f"cosine_{conf.cosine_threshold}_frac_{conf.frac_visit}_seed_{conf.seed}")
+
+    conf.num_epochs_on_single_roll_out = 1
+    conf.writer = SummaryWriter(log_dir=os.path.join(conf.log_dir, "logs", conf.exp_name))
+
+    hyparams = {
+        'dataset': conf.dataset,
+        'pretrain': conf.pretrain,
+        'classifier_arch': conf.classifier_arch,
+        'lr': conf.lr,
+        'seed': conf.seed,
+        'frac_visit': conf.frac_visit,
+        'gamma': conf.gamma,
+        'clip': conf.clip,
+        'num_envs': conf.num_envs,
+        'num_epochs_on_single_roll_out': conf.num_epochs_on_single_roll_out,
+        'only_ce_as_reward': conf.only_ce_as_reward,
+        'lambda': conf.lam,
+        'use_gae': conf.use_gae,
+        'max_gradient_norm': conf.max_grad_norm,
+        'entropy_coef': conf.entropy_coef,
+        'use_entropy_loss': conf.use_entropy_loss,
+    }
+    hyparams['fraction of visit'] = conf.frac_visit
+    hyparams['num_envs'] = conf.num_envs
+    hyparams_text = "\n".join([f"**{key}**: {value}" for key, value in hyparams.items()])
+    conf.writer.add_text("Hyperparameters", hyparams_text)
+
+
+    ckpt_dir = os.path.join(conf.log_dir, "models", conf.exp_name)
+    os.makedirs(ckpt_dir, exist_ok=True)  # Create the 'ckpt' directory if it doesn't exist
+
+    print("Used config:");
+    pprint(vars(conf));
+
+    # Loading seed
+    set_seed(random_seed) # Setting the random seed for reproducibility
+
+
+    # dataloaders
+    train_data, val_data, test_data = build_HDF5_feat_dataset_2(conf.level1_path, conf.level3_path, conf)
+    train_loader = DataLoader(train_data, batch_size=conf.B, shuffle=True, num_workers=conf.n_worker, pin_memory=conf.pin_memory, drop_last=True)
+    val_loader = DataLoader(val_data, batch_size=conf.B, shuffle=False, num_workers=conf.n_worker, pin_memory=conf.pin_memory, drop_last=False)
+    test_loader = DataLoader(test_data, batch_size=conf.B, shuffle=False, num_workers=conf.n_worker, pin_memory=conf.pin_memory, drop_last=False)
+
+    # Loading HAFED
+    classifier_dict, _, config, _ = load_model(ckpt_path=conf.classifier_ckpt_path, args= args)
+    classifier_conf = SimpleNamespace(**config)
+
+
+    if conf.classifier_arch == 'hafed':
+        classifier = HAFED(classifier_conf, n_token_1=classifier_conf.n_token_1,
+                           n_token_2=classifier_conf.n_token_2, n_masked_patch_1=classifier_conf.n_masked_patch_1,
+                           n_masked_patch_2=classifier_conf.n_masked_patch_2, mask_drop=classifier_conf.mask_drop)
+    else :
+        raise Exception("Select a valid classifier architecture.")
+
+    classifier.to(conf.device)
+    classifier.load_state_dict(classifier_dict)
+    classifier.eval()
+
+
+    # Loading TSU
+    fglobal_dict = torch.load(conf.mlp_fglobal_ckpt, map_location=conf.device)
+    fglobal = FGlobal(ip_dim=384 * 3, op_dim=384).to(conf.device)
+    fglobal.load_state_dict(fglobal_dict['model'])
+    fglobal.eval()
+
+    # Loading RL Agent ----> Actor / Critic
+    actor = Actor(conf=conf)
+    critic = Critic(conf=conf)
+    model = Agent(actor, critic, conf).to(conf.device)
+    actor_optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, actor.parameters()), lr=conf.lr, weight_decay=conf.wd)
+    critic_optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, critic.parameters()), lr=conf.lr, weight_decay=conf.wd)
+
+
+    best_state = {'epoch': -1, 'val_acc': 0, 'val_auc': 0, 'val_f1': 0, 'test_acc': 0, 'test_auc': 0, 'test_f1': 0, 'val_loss': 0, 'test_loss': 0,
+                  'test_bal_acc': 0, 'test_precision': 0, 'test_recall': 0}
+    start_epoch = 0
+
+    if conf.restart:
+        epoch = 0
+        model = load_actor_only(model, conf.rl_ckpt_path, conf.device)
+        actor_optimizer = torch.optim.AdamW(
+            filter(lambda p: p.requires_grad, model.actor.parameters()),
+            lr=conf.lr,
+            weight_decay=conf.wd,
+        )
+
+        critic_optimizer = torch.optim.AdamW(
+            filter(lambda p: p.requires_grad, model.critic.parameters()),
+            lr=conf.lr,
+            weight_decay=conf.wd,
+        )
+
+        val_auc, val_acc, val_f1, val_loss, val_balanced_acc, val_precision, val_recall = evaluate_policy(model,
+                                                        fglobal, classifier, val_loader,'Val', conf.device,
+                                                        start_epoch, conf)
+
+        test_auc, test_acc, test_f1, test_loss, test_balanced_acc, test_precision, test_recall = evaluate_policy(model,
+                                                                fglobal, classifier, test_loader,'Test', conf.device,
+                                                                start_epoch, conf)
+
+        best_state = {'epoch': start_epoch, 'val_acc': val_acc, 'val_auc': val_auc, 'val_f1': val_f1,
+                      'val_loss': val_loss,
+                      'test_acc': test_acc, 'test_auc': test_auc, 'test_f1': test_f1, 'test_bal_acc': test_balanced_acc,
+                      'test_precision': test_precision, 'test_recall': test_recall, 'test_loss': test_loss}
+
+        save_policy_model(conf=conf, model=model, actor_optimizer=actor_optimizer,
+                              critic_optimizer=critic_optimizer, epoch=epoch,
+                              save_path=os.path.join(ckpt_dir, 'checkpoint-best.pt'))
+        start_epoch+=1
+
+    train_epoch = conf.train_epoch
+    train_epoch = train_epoch + start_epoch
+    for epoch in range(start_epoch, train_epoch):
+        train_one_epoch(model, fglobal, classifier, train_loader, actor_optimizer, critic_optimizer, conf.device, epoch, conf)
+
+        val_auc, val_acc, val_f1, val_loss, val_balanced_acc, val_precision, val_recall = evaluate_policy(model,
+                                                fglobal, classifier, val_loader,'Val', conf.device, epoch, conf)
+
+        test_auc, test_acc, test_f1, test_loss, test_balanced_acc, test_precision, test_recall = evaluate_policy(model,
+                                    fglobal, classifier, test_loader,'Test', conf.device, epoch, conf)
+
+        if (2 - val_auc - val_f1) + val_loss < (2 - best_state['val_auc'] - best_state['val_f1']) + best_state[
+            'val_loss']:
+            best_state['epoch'] = epoch
+            best_state['val_auc'] = val_auc
+            best_state['val_acc'] = val_acc
+            best_state['val_f1'] = val_f1
+            best_state['val_loss'] = val_loss
+            best_state['test_auc'] = test_auc
+            best_state['test_acc'] = test_acc
+            best_state['test_f1'] = test_f1
+            best_state['test_bal_acc'] = test_balanced_acc
+            best_state['test_precision'] = test_precision
+            best_state['test_recall'] = test_recall
+            best_state['test_loss'] = test_loss
+            save_policy_model(conf=conf, model=model, actor_optimizer=actor_optimizer,
+                              critic_optimizer=critic_optimizer, epoch=epoch,
+                              save_path=os.path.join(ckpt_dir, 'checkpoint-best.pt'))
+
+        print('\n')
+
+    save_policy_model(conf=conf, model=model, actor_optimizer=actor_optimizer, critic_optimizer=critic_optimizer,
+                      epoch=epoch, save_path=os.path.join(ckpt_dir, 'checkpoint-last.pt'))
+
+    print("Results on best epoch:")
+    print(best_state)
+    best_state_text = "\n".join([f"{key}: {value}" for key, value in best_state.items()])
+    conf.writer.add_text("Best Model State", best_state_text, global_step=best_state["epoch"])
+    conf.writer.close()
+@torch.no_grad()
+def critic_in_minibatches(
+    model,
+    batch_obs,
+    minibatch_size,
+):
+    """
+    Compute ONLY critic values for GAE.
+
+    Avoids unnecessarily running the Transformer actor.
+    """
+
+    values = []
+
+    num_samples = batch_obs.shape[0]
+
+    for start in range(
+        0,
+        num_samples,
+        minibatch_size,
+    ):
+        end = min(
+            start + minibatch_size,
+            num_samples,
+        )
+
+        obs_mb = batch_obs[start:end]
+
+        V_mb = model.critic(
+            obs_mb
+        )
+
+        values.append(
+            V_mb.flatten()
+        )
+
+    return torch.cat(
+        values,
+        dim=0,
+    )
+@torch.no_grad()
+def evaluate_in_minibatches(
+    model,
+    batch_obs,
+    batch_acts,
+    minibatch_size,
+):
+    """
+    Memory-efficient evaluation of a rollout.
+
+    IMPORTANT:
+    This chunks only the PPO rollout/sample dimension.
+
+    batch_obs:
+        [T_total, N, D]
+
+    Each individual state still contains ALL N patches.
+    Therefore the Transformer architecture and patch-level
+    attention are unchanged.
+
+    Used for V_old / GAE construction, so gradients are not needed.
+    """
+
+    values = []
+    log_probs = []
+    entropies = []
+
+    num_samples = batch_obs.shape[0]
+
+    for start in range(
+        0,
+        num_samples,
+        minibatch_size,
+    ):
+        end = min(
+            start + minibatch_size,
+            num_samples,
+        )
+
+        obs_mb = batch_obs[
+            start:end
+        ]
+
+        acts_mb = batch_acts[
+            start:end
+        ]
+
+        V_mb, log_probs_mb, entropy_mb = model.evaluate(
+            obs_mb,
+            acts_mb,
+        )
+
+        values.append(
+            V_mb.flatten()
+        )
+
+        log_probs.append(
+            log_probs_mb.flatten()
+        )
+
+        entropies.append(
+            entropy_mb.flatten()
+        )
+
+    values = torch.cat(
+        values,
+        dim=0,
+    )
+
+    log_probs = torch.cat(
+        log_probs,
+        dim=0,
+    )
+
+    entropies = torch.cat(
+        entropies,
+        dim=0,
+    )
+
+    return (
+        values,
+        log_probs,
+        entropies,
+    )
+def train_one_epoch(
+    model,
+    fglobal,
+    classifier,
+    data_loader,
+    actor_optimizer,
+    critic_optimizer,
+    device,
+    epoch,
+    conf,
+):
+    model.train()
+
+    metric_logger = MetricLogger(
+        delimiter="  "
+    )
+
+    metric_logger.add_meter(
+        "actor_lr",
+        SmoothedValue(
+            window_size=1,
+            fmt="{value:.6f}",
+        ),
+    )
+
+    metric_logger.add_meter(
+        "critic_lr",
+        SmoothedValue(
+            window_size=1,
+            fmt="{value:.6f}",
+        ),
+    )
+
+    header = "Epoch: [{}]".format(
+        epoch
+    )
+
+    print_freq = 100
+
+    epoch_actor_loss = 0.0
+    epoch_critic_loss = 0.0
+
+    # ============================================================
+    # PPO minibatch size
+    #
+    # Start with 4 for Camelyon.
+    # If memory is comfortable, increase to 8 / 16.
+    # ============================================================
+
+    ppo_minibatch_size = getattr(
+        conf,
+        "ppo_minibatch_size",
+        128,
+    )
+
+    for data_it, data in enumerate(
+        metric_logger.log_every(
+            data_loader,
+            print_freq,
+            header,
+        )
+    ):
+
+        # ========================================================
+        # Load one WSI
+        # ========================================================
+
+        hr_features = data[
+            "hr"
+        ][0].to(
+            device,
+            dtype=torch.float32,
+        )
+
+        initial_state = data[
+            "lr"
+        ].to(
+            device,
+            dtype=torch.float32,
+        ).clone()
+
+        label = data[
+            "label"
+        ].to(
+            device
+        )
+
+        # ========================================================
+        # Environment
+        # ========================================================
+
+        if conf.fglobal == "attn":
+
+            env = WSIObservationEnv(
+                lr_features=initial_state,
+                hr_features=hr_features,
+                label=label,
+                conf=conf,
+            )
+
+        else:
+
+            env = WSICosineObservationEnv(
+                lr_features=initial_state,
+                hr_features=hr_features,
+                label=label,
+                conf=conf,
+            )
+
+        # ========================================================
+        # PPO rollout containers
+        # ========================================================
+
+        batch_obs = []
+        batch_acts = []
+        batch_log_probs = []
+        batch_rews = []
+        batch_lens = []
+        dones = []
+
+        # ========================================================
+        # Collect on-policy trajectories
+        # ========================================================
+
+        with torch.no_grad():
+
+            for env_idx in range(
+                conf.num_envs
+            ):
+
+                ep_rews = []
+
+                visited_patch_id = []
+
+                env.reset()
+
+                state = initial_state.clone()
+
+                done = False
+                ep_t = 0
+
+                while not done:
+
+                    # --------------------------------------------
+                    # State BEFORE taking action
+                    # --------------------------------------------
+
+                    batch_obs.append(
+                        state.clone()
+                    )
+
+                    # --------------------------------------------
+                    # Current policy action
+                    # --------------------------------------------
+
+                    action, log_prob, entropy = (
+                        model.get_action(
+                            state,
+                            visited_patch_id,
+                            is_eval=False,
+                        )
+                    )
+
+                    # --------------------------------------------
+                    # Environment transition
+                    # --------------------------------------------
+
+                    state, reward, done = env.step(
+                        action=action,
+                        state_update_net=fglobal,
+                        classifier_net=classifier,
+                        device=device,
+                    )
+
+                    # --------------------------------------------
+                    # Store transition
+                    # --------------------------------------------
+
+                    ep_rews.append(
+                        reward
+                    )
+
+                    batch_acts.append(
+                        action.item()
+                    )
+
+                    batch_log_probs.append(
+                        log_prob.item()
+                    )
+
+                    visited_patch_id.append(
+                        action.item()
+                    )
+
+                    dones.append(
+                        done
+                    )
+
+                    ep_t += 1
+
+                batch_lens.append(
+                    ep_t
+                )
+
+                batch_rews.append(
+                    ep_rews
+                )
+
+        # ========================================================
+        # Convert rollout to tensors
+        # ========================================================
+
+        batch_obs = torch.stack(
+            batch_obs
+        ).squeeze(1)
+
+        # Categorical actions are indices.
+        batch_acts = torch.tensor(
+            batch_acts,
+            dtype=torch.long,
+            device=device,
+        )
+
+        batch_log_probs = torch.tensor(
+            batch_log_probs,
+            dtype=torch.float32,
+            device=device,
+        )
+
+        batch_rtgs_mc = compute_rtgs(
+            batch_rews,
+            conf,
+        ).to(
+            device
+        ).flatten()
+
+        num_rollout_samples = (
+            batch_obs.shape[0]
+        )
+
+        # ========================================================
+        # IMPORTANT:
+        #
+        # Do NOT do:
+        #
+        # V_old, _, _ = model.evaluate(
+        #     batch_obs,
+        #     batch_acts
+        # )
+        #
+        # That sends the whole rollout through the Transformer.
+        #
+        # Instead evaluate it in small PPO minibatches.
+        # ========================================================
+
+        V_old = critic_in_minibatches(
+            model=model,
+            batch_obs=batch_obs,
+            minibatch_size=ppo_minibatch_size,
+        )
+
+        V_old = V_old.flatten()
+
+        # ========================================================
+        # Compute advantages / critic targets
+        # ========================================================
+
+        if conf.use_gae:
+
+            # ----------------------------------------------------
+            # Each environment has the same episode horizon,
+            # therefore reshape by num_envs just like SASHA.
+            # ----------------------------------------------------
+
+            V_numpy = (
+                V_old
+                .view(
+                    conf.num_envs,
+                    -1,
+                )
+                .cpu()
+                .numpy()
+            )
+
+            dones_numpy = np.asarray(
+                dones,
+                dtype=np.float32,
+            ).reshape(
+                conf.num_envs,
+                -1,
+            )
+
+            rews_numpy = np.asarray(
+                batch_rews,
+                dtype=np.float32,
+            ).reshape(
+                conf.num_envs,
+                -1,
+            )
+
+            A_k_np = gae(
+                rewards=rews_numpy,
+                values=V_numpy,
+                episode_ends=dones_numpy,
+                gamma=conf.gamma,
+                lam=conf.lam,
+            )
+
+            A_k = torch.tensor(
+                A_k_np,
+                dtype=torch.float32,
+                device=device,
+            ).flatten()
+
+            # ----------------------------------------------------
+            # Correct GAE / lambda-return critic target
+            #
+            # R_lambda = A_GAE + V_old
+            # ----------------------------------------------------
+
+            value_targets = (
+                A_k
+                + V_old.detach()
+            )
+
+        else:
+
+            value_targets = (
+                batch_rtgs_mc
+            )
+
+            A_k = (
+                value_targets
+                - V_old.detach()
+            )
+
+        # ========================================================
+        # Normalize advantage ONLY for actor
+        # ========================================================
+
+        A_k = (
+            A_k - A_k.mean()
+        ) / (
+            A_k.std()
+            + 1e-8
+        )
+
+        # Old rollout quantities must stay fixed through all
+        # PPO epochs.
+        batch_log_probs = (
+            batch_log_probs.detach()
+        )
+
+        A_k = A_k.detach()
+
+        value_targets = (
+            value_targets.detach()
+        )
+
+        # ========================================================
+        # PPO optimization
+        #
+        # OLD:
+        #
+        # model.evaluate(
+        #     ALL rollout samples
+        # )
+        #
+        # NEW:
+        #
+        # shuffle rollout indices and train with small minibatches.
+        # ========================================================
+
+        rollout_actor_losses = []
+        rollout_critic_losses = []
+
+        for ppo_epoch in range(
+            conf.num_epochs_on_single_roll_out
+        ):
+
+            # ----------------------------------------------------
+            # Shuffle PPO samples each update epoch
+            # ----------------------------------------------------
+
+            permutation = torch.randperm(
+                num_rollout_samples,
+                device=device,
+            )
+
+            for start in range(
+                0,
+                num_rollout_samples,
+                ppo_minibatch_size,
+            ):
+
+                end = min(
+                    start + ppo_minibatch_size,
+                    num_rollout_samples,
+                )
+
+                mb_indices = permutation[
+                    start:end
+                ]
+
+                # =================================================
+                # Extract PPO minibatch
+                # =================================================
+
+                obs_mb = batch_obs[
+                    mb_indices
+                ]
+
+                acts_mb = batch_acts[
+                    mb_indices
+                ]
+
+                old_log_probs_mb = (
+                    batch_log_probs[
+                        mb_indices
+                    ]
+                )
+
+                advantages_mb = (
+                    A_k[
+                        mb_indices
+                    ]
+                )
+
+                value_targets_mb = (
+                    value_targets[
+                        mb_indices
+                    ]
+                )
+
+                # =================================================
+                # Evaluate ONLY this minibatch
+                #
+                # Shape approximately:
+                #
+                # [ppo_minibatch_size, N, D]
+                #
+                # instead of:
+                #
+                # [whole_rollout, N, D]
+                # =================================================
+
+                V_mb, curr_log_probs_mb, entropy_mb = (
+                    model.evaluate(
+                        obs_mb,
+                        acts_mb,
+                    )
+                )
+
+                V_mb = V_mb.flatten()
+
+                curr_log_probs_mb = (
+                    curr_log_probs_mb.flatten()
+                )
+
+                entropy_mb = (
+                    entropy_mb.flatten()
+                )
+
+                # =================================================
+                # PPO probability ratio
+                # =================================================
+
+                ratios = torch.exp(
+                    curr_log_probs_mb
+                    - old_log_probs_mb
+                )
+
+                # =================================================
+                # Clipped surrogate actor objective
+                # =================================================
+
+                surr1 = (
+                    ratios
+                    * advantages_mb
+                )
+
+                surr2 = (
+                    torch.clamp(
+                        ratios,
+                        1.0 - conf.clip,
+                        1.0 + conf.clip,
+                    )
+                    * advantages_mb
+                )
+
+                actor_loss = (
+                    -torch.min(
+                        surr1,
+                        surr2,
+                    )
+                ).mean()
+
+                # =================================================
+                # Critic objective
+                # =================================================
+
+                critic_loss = (
+                    nn.MSELoss()(
+                        V_mb,
+                        value_targets_mb,
+                    )
+                )
+
+                # =================================================
+                # Entropy
+                # =================================================
+
+                entropy_loss = (
+                    entropy_mb.mean()
+                )
+
+                if conf.use_entropy_loss:
+
+                    actor_loss -= (
+                        conf.entropy_coef
+                        * entropy_loss
+                    )
+
+                # =================================================
+                # Actor update
+                # =================================================
+
+                actor_optimizer.zero_grad(
+                    set_to_none=True
+                )
+
+                actor_loss.backward()
+
+                nn.utils.clip_grad_norm_(
+                    model.actor.parameters(),
+                    conf.max_grad_norm,
+                )
+
+                actor_optimizer.step()
+
+                # =================================================
+                # Critic update
+                # =================================================
+
+                critic_optimizer.zero_grad(
+                    set_to_none=True
+                )
+
+                critic_loss.backward()
+
+                nn.utils.clip_grad_norm_(
+                    model.critic.parameters(),
+                    conf.max_grad_norm,
+                )
+
+                critic_optimizer.step()
+
+                # =================================================
+                # Statistics
+                # =================================================
+
+                actor_loss_value = float(
+                    actor_loss.item()
+                )
+
+                critic_loss_value = float(
+                    critic_loss.item()
+                )
+
+                rollout_actor_losses.append(
+                    actor_loss_value
+                )
+
+                rollout_critic_losses.append(
+                    critic_loss_value
+                )
+
+        # ========================================================
+        # Mean losses across all PPO minibatches
+        #
+        # Better than logging only the final minibatch.
+        # ========================================================
+
+        mean_actor_loss = float(
+            np.mean(
+                rollout_actor_losses
+            )
+        )
+
+        mean_critic_loss = float(
+            np.mean(
+                rollout_critic_losses
+            )
+        )
+
+        epoch_actor_loss += (
+            mean_actor_loss
+        )
+
+        epoch_critic_loss += (
+            mean_critic_loss
+        )
+
+        # ========================================================
+        # Metric logger
+        # ========================================================
+
+        metric_logger.update(
+            actor_lr=
+            actor_optimizer.param_groups[
+                0
+            ]["lr"]
+        )
+
+        metric_logger.update(
+            critic_lr=
+            critic_optimizer.param_groups[
+                0
+            ]["lr"]
+        )
+
+        metric_logger.update(
+            actor_loss=
+            mean_actor_loss
+        )
+
+        metric_logger.update(
+            critic_loss=
+            mean_critic_loss
+        )
+
+        # ========================================================
+        # TensorBoard
+        # ========================================================
+
+        if conf.logs != "disabled":
+
+            global_step = (
+                data_it
+                + epoch
+                * len(data_loader)
+            )
+
+            conf.writer.add_scalar(
+                "Loss/critic_loss",
+                mean_critic_loss,
+                global_step,
+            )
+
+            conf.writer.add_scalar(
+                "Loss/actor_loss",
+                mean_actor_loss,
+                global_step,
+            )
+
+        # ========================================================
+        # Explicitly release large rollout objects
+        # ========================================================
+
+        del batch_obs
+        del batch_acts
+        del batch_log_probs
+        del batch_rtgs_mc
+        del V_old
+        del A_k
+        del value_targets
+
+        del rollout_actor_losses
+        del rollout_critic_losses
+
+        # You normally don't need this every iteration.
+        # If Camelyon remains extremely close to the GPU limit,
+        # you can uncomment it.
+        #
+        # torch.cuda.empty_cache()
+
+    # ============================================================
+    # Epoch logs
+    # ============================================================
+
+    if conf.logs != "disabled":
+
+        conf.writer.add_scalar(
+            "Epoch_Loss/critic_loss",
+            epoch_critic_loss
+            / len(data_loader),
+            epoch,
+        )
+
+        conf.writer.add_scalar(
+            "Epoch_Loss/actor_loss",
+            epoch_actor_loss
+            / len(data_loader),
+            epoch,
+        )
+def train_one_epoch_old(model, fglobal, classifier, data_loader, actor_optimizer, critic_optimizer, device, epoch, conf):
+    model.train()
+    metric_logger = MetricLogger(delimiter="  ")
+    metric_logger.add_meter('actor_lr', SmoothedValue(window_size=1, fmt='{value:.6f}'))
+    metric_logger.add_meter('critic_lr', SmoothedValue(window_size=1, fmt='{value:.6f}'))
+    header = 'Epoch: [{}]'.format(epoch)
+    print_freq = 100
+
+    epoch_actor_loss = 0
+    epoch_critic_loss = 0
+    for data_it, data in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
+        # torch.cuda.empty_cache()
+        hr_features = data['hr'][0].to(device, dtype=torch.float32)
+        state = data['lr'].to(device, dtype=torch.float32).clone()
+        label = data['label'].to(device)
+        if conf.fglobal == 'attn':
+            env = WSIObservationEnv(lr_features=state, hr_features=hr_features, label=label, conf=conf)
+        else:
+            env = WSICosineObservationEnv(lr_features=state, hr_features=hr_features, label=label, conf=conf)
+
+        # adjust_learning_rate(actor_optimizer, epoch + data_it / len(data_loader), conf)
+        # adjust_learning_rate(critic_optimizer, epoch + data_it / len(data_loader), conf)
+
+        # collecting data as PPO is a onpolicy algorithm
+        batch_obs = []
+        batch_acts = []
+        batch_log_probs = []
+        batch_rews = []
+        batch_lens = []
+        dones = []
+        N = state.shape[1]
+        T = min(N, int(conf.frac_visit * N))
+        with torch.no_grad():
+            for i in range(conf.num_envs):
+                ep_rews = []
+                visited_patch_id = []
+                env.reset()
+                done = False
+                ep_t = 0
+                while not done:
+                    # track observations in this batch
+                    batch_obs.append(state)
+                    action, log_prob, entropy = model.get_action(state, visited_patch_id, is_eval = False)
+                    state, reward, done = env.step(action=action, state_update_net=fglobal, classifier_net=classifier,
+                                                   device=device)
+                    ep_rews.append(reward)
+                    batch_acts.append(action.item())
+                    batch_log_probs.append(log_prob.item())
+                    visited_patch_id.append(action.item())
+                    dones.append(done)
+                    ep_t += 1
+                state = data['lr'].to(device, dtype=torch.float32).clone()
+                batch_lens.append(ep_t + 1)
+                batch_rews.append(ep_rews)
+
+            batch_obs = torch.stack(batch_obs).squeeze(1)
+            batch_acts = torch.tensor(batch_acts, dtype=torch.float, device=conf.device)
+            batch_log_probs = torch.tensor(batch_log_probs, dtype=torch.float, device=conf.device)
+            batch_rtgs = compute_rtgs(batch_rews, conf).to(conf.device)
+            V_old, _, _ = model.evaluate(batch_obs, batch_acts)
+
+            if conf.use_gae:
+                V_numpy = V_old.view(conf.num_envs, -1).cpu().numpy()
+                dones_numpy = np.array(dones).reshape(conf.num_envs, -1)
+                rews_numpy = np.array(batch_rews).reshape(conf.num_envs, -1)
+                
+                A_k = gae(rewards=rews_numpy, values=V_numpy, episode_ends=dones_numpy, gamma=conf.gamma, lam=conf.lam)
+                A_k = torch.tensor(A_k, dtype=torch.float, device=conf.device).flatten()
+                
+                # Set the critic target to the GAE returns
+                batch_rtgs = A_k + V_old.detach().flatten()
+
+            else:
+                A_k = batch_rtgs - V_old.detach().flatten()
+
+            A_k = (A_k - A_k.mean()) / (A_k.std() + 1e-8)
+
+        # updating parameters for n epochs
+
+        for _ in range(conf.num_epochs_on_single_roll_out):
+            # torch.cuda.empty_cache()
+            V, curr_log_probs, entropy = model.evaluate(batch_obs, batch_acts)
+            ratios = torch.exp(curr_log_probs - batch_log_probs)
+
+            # calculate surrogate loss
+            surr1 = ratios * A_k
+            surr2 = torch.clamp(ratios, 1 - conf.clip, 1 + conf.clip) * A_k
+            actor_loss = (-torch.min(surr1, surr2)).mean()
+
+            # Critic loss
+            critic_loss = nn.MSELoss()(V.flatten(), batch_rtgs)
+            entropy_loss = entropy.mean()
+
+            if conf.use_entropy_loss:
+                actor_loss -= conf.entropy_coef * entropy_loss
+
+            # updating actor
+            actor_optimizer.zero_grad()
+            actor_loss.backward()
+            nn.utils.clip_grad_norm_(model.actor.parameters(), conf.max_grad_norm)
+            actor_optimizer.step()
+
+            # updating critic
+            critic_optimizer.zero_grad()
+            critic_loss.backward()
+            nn.utils.clip_grad_norm_(model.critic.parameters(), conf.max_grad_norm)
+            critic_optimizer.step()
+
+            epoch_actor_loss += actor_loss.item()
+            epoch_critic_loss += critic_loss.item()
+
+            # Clear CUDA cache
+            # torch.cuda.empty_cache()
+            # gc.collect()
+
+        metric_logger.update(actor_lr=actor_optimizer.param_groups[0]['lr'])
+        metric_logger.update(critic_lr=critic_optimizer.param_groups[0]['lr'])
+        metric_logger.update(actor_loss=actor_loss.item())
+        metric_logger.update(critic_loss=critic_loss.item())
+
+        if conf.logs != 'disabled':
+            conf.writer.add_scalar("Loss/critic_loss", critic_loss.item(), data_it + (epoch * len(data_loader)))
+            conf.writer.add_scalar("Loss/actor_loss", actor_loss.item(), data_it + (epoch * len(data_loader)))
+
+        # del batch_obs, batch_acts, batch_log_probs, batch_rtgs, V, curr_log_probs, ratios, surr1, surr2, A_k
+
+        # # Clear CUDA cache
+        # torch.cuda.empty_cache()
+        # gc.collect()
+
+    if conf.logs != 'disabled':
+        conf.writer.add_scalar("Epoch_Loss/critic_loss", epoch_critic_loss / len(data_loader), epoch)
+        conf.writer.add_scalar("Epoch_Loss/actor_loss", epoch_actor_loss / len(data_loader), epoch)
+
+
+@torch.no_grad()
+def evaluate_policy(model, fglobal, classifier, data_loader, header, device, epoch, conf):
+    model.eval()
+
+    y_pred = []
+    y_true = []
+    metric_logger = MetricLogger(delimiter=" ")
+    final_reward = 0
+
+    for data in metric_logger.log_every(data_loader, 100, header):
+        hr_features = data['hr'][0].to(device, dtype=torch.float32)
+        state = data['lr'].to(device, dtype=torch.float32)
+        label = data['label'].to(device)
+
+        if conf.fglobal == 'attn':
+            env = WSIObservationEnv(lr_features=state, hr_features=hr_features, label=label, conf=conf)
+        else:
+            env = WSICosineObservationEnv(lr_features=state, hr_features=hr_features, label=label, conf=conf)
+
+        N = state.shape[1]
+        visited_patch_id = []
+        done = False
+        while not done:
+            action, log_prob, entropy = model.get_action(state, visited_patch_id, is_eval = True)
+            new_state, reward, done = env.step(action=action, state_update_net=fglobal, classifier_net=classifier,
+                                               device=device)
+            state = new_state
+
+        final_reward += reward
+        loss = -1 * reward
+        slide_preds, attn = classifier.classify(state)
+        pred = torch.softmax(slide_preds, dim=-1)
+        acc1 = accuracy(pred, label, topk=(1,))[0]
+        metric_logger.update(loss=loss)
+        metric_logger.meters['acc1'].update(acc1.item(), n=label.shape[0])
+
+        y_pred.append(pred)
+        y_true.append(label)
+
+    y_pred = torch.cat(y_pred, dim=0)
+    y_true = torch.cat(y_true, dim=0)
+    y_pred_labels = torch.argmax(y_pred, dim=-1)
+    AUROC_metric = torchmetrics.AUROC(task='binary').to(device)
+    AUROC_metric(y_pred[:, 1], y_true)
+    auroc = AUROC_metric.compute().item()
+    F1_metric = torchmetrics.F1Score(task='binary').to(device)
+    F1_metric(y_pred_labels, y_true)
+    f1_score = F1_metric.compute().item()
+
+    Precision_metric = torchmetrics.Precision(task='binary').to(device)
+    Precision_metric(y_pred_labels, y_true)
+    precision = Precision_metric.compute().item()
+
+    Recall_metric = torchmetrics.Recall(task='binary').to(device)
+    Recall_metric(y_pred_labels, y_true)
+    recall = Recall_metric.compute().item()
+
+    y_pred_np = y_pred_labels.cpu().numpy()
+    y_true_np = y_true.cpu().numpy()
+    balanced_acc = balanced_accuracy_score(y_true_np, y_pred_np)
+
+    print('* Acc@1 {top1.global_avg:.3f} loss {losses.global_avg:.3f} auroc {AUROC:.3f} f1_score {F1:.3f}'
+          .format(top1=metric_logger.acc1, losses=metric_logger.loss, AUROC=auroc, F1=f1_score))
+
+    if conf.logs != 'disabled':
+        conf.writer.add_scalar(f"{header}/accuracy", metric_logger.acc1.global_avg, epoch)
+        conf.writer.add_scalar(f"{header}/auroc", auroc, epoch)
+        conf.writer.add_scalar(f"{header}/f1", f1_score, epoch)
+        conf.writer.add_scalar(f"{header}/loss", metric_logger.loss.global_avg, epoch)
+
+
+    return auroc, metric_logger.acc1.global_avg, f1_score, metric_logger.loss.global_avg, balanced_acc, precision, recall
+
+
+if __name__ == '__main__':
+    random_seed = 1130
+    main(random_seed=random_seed)
