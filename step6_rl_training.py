@@ -50,6 +50,11 @@ from utils.utils import save_policy_model, Struct, set_seed
 def get_arguments():
 
     parser = argparse.ArgumentParser('RL training', add_help=False)
+    parser.add_argument('--dataset', default=None)
+    parser.add_argument('--level1_path', default=None)
+    parser.add_argument('--level3_path', default=None)
+    parser.add_argument('--mlp_fglobal_ckpt', default=None)
+    parser.add_argument('--classifier_ckpt_path', default=None)
     parser.add_argument('--frac_visit', type=float, default=0.2)
     parser.add_argument('--config', default= None, help='path to config file')
     parser.add_argument('--seed', type=int, default=5, help='set the seed to select dataset split') 
