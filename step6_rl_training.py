@@ -266,7 +266,7 @@ def main():
     critic_optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, critic.parameters()), lr=conf.lr, weight_decay=conf.wd)
 
 
-    best_state = {'epoch': -1, 'val_acc': 0, 'val_auc': 0, 'val_f1': 0, 'test_acc': 0, 'test_auc': 0, 'test_f1': 0, 'val_loss': 0, 'test_loss': 0,
+    best_state = {'epoch': -1, 'val_acc': 0, 'val_auc': 0, 'val_f1': 0, 'test_acc': 0, 'test_auc': 0, 'test_f1': 0, 'val_loss': -1000000, 'test_loss': 0,
                   'test_bal_acc': 0, 'test_precision': 0, 'test_recall': 0}
     start_epoch = 0
 
@@ -309,7 +309,7 @@ def main():
         train_one_epoch(model, fglobal, classifier, train_loader, actor_optimizer, critic_optimizer, conf.device, epoch, conf)
 
         val_auc, val_acc, val_f1, val_loss, val_balanced_acc, val_precision, val_recall = evaluate_policy(model,
-                                                fglobal, classifier, val_loader,'Val', conf.device, epoch, conf)
+                                                fglobal, classifier, train_loader,'Val', conf.device, epoch, conf)
 
         test_auc, test_acc, test_f1, test_loss, test_balanced_acc, test_precision, test_recall = evaluate_policy(model,
                                     fglobal, classifier, test_loader,'Test', conf.device, epoch, conf)
